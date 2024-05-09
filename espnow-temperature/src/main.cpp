@@ -19,7 +19,8 @@
 static DHT dht(4, DHT22);
 
 //uint8_t receiver_mac[6] = {0x34, 0x94, 0x54, 0x24, 0x95, 0xc8};     // esp32-receiver
-uint8_t receiver_mac[6] = {0x30, 0x30, 0xf9, 0x18, 0x14, 0xf8};     // seeed esp32-s3
+//uint8_t receiver_mac[6] = {0x30, 0x30, 0xf9, 0x18, 0x14, 0xf8};     // seeed esp32-s3 (bad?)
+uint8_t receiver_mac[6] = {0x84, 0xfc, 0xe6, 0x78, 0x23, 0xec};     // seeed esp32-s3 number 2
 //uint8_t receiver_mac[6] = {0xdc, 0xa6, 0x32, 0xcc, 0xa6, 0x4d};     // pi wlan0
 //uint8_t receiver_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
@@ -77,10 +78,10 @@ void OnDataSent(uint8_t *mac_addr, uint8_t status) {
 
     uint32_t sleep_time_secs;
     if (status == ESP_NOW_SEND_SUCCESS) {
-        sleep_time_secs = 1 * 60;
+        sleep_time_secs = 15 * 60;
     } else {
         // Bring the next time forwards, but delay by a random amount to prevent collisions.
-        sleep_time_secs = random(60, 2 * 60);
+        sleep_time_secs = random(1 * 60, 2 * 60);
     }
 
     Serial.print("Up: "); Serial.print(millis()); Serial.print(" millis. Sleeping "); Serial.print(sleep_time_secs); Serial.println(" secs");
@@ -176,8 +177,8 @@ static void send_message(float humidity, float temperature) {
              "\"seq\": %d, "
              "\"success\": %d, "
              "\"fail\": %d, "
-             "\"temperature\": %f, "
-             "\"humidity\": %f "
+             "\"t\": %0.1f, "
+             "\"h\": %0.1f "
              "}",
              payload.sequence,
              payload.send_success,
