@@ -23,6 +23,8 @@
 // Note that by default, the MQTT client limits messages to shorter than this.
 #define MESSAGE_LEN MQTT_MAX_PACKET_SIZE
 
+#define WIFI_WAIT_TIMEOUT_MILLIS 60000
+
 typedef struct {
     unsigned long arrival;
     uint32_t sequence;
@@ -64,16 +66,22 @@ void sanityCheck();
 
 static void restart(const char *why) {
     Serial.println(why);
-    Serial.flush();
+    // Don't use flush in case it hangs.
+    //Serial.flush();
+    delay(50);
     ESP.restart();
 }
 
-static timeval cbtime;			// time set in callback
-static bool cbtime_set = false;
-static void time_is_set(void) {
-    gettimeofday(&cbtime, NULL);
-    cbtime_set = true;
-    Serial.println("------------------ settimeofday() was called ------------------");
+const char *now() {
+    static char time_buff[9];
+    if (!timeClient.isTimeSet()) {
+        return "";
+    }
+
+    time_t now = (time_t)timeClient.getEpochTime();
+    struct tm *t = gmtime(&now);
+    strftime(time_buff, sizeof(time_buff), "%H:%M:%S", t);
+    return time_buff;
 }
 
 // callback function that will be executed when data is received
@@ -87,7 +95,8 @@ void OnDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
     memcpy((void *)inbound_message.message, incomingData, len);
     inbound_message.message[len] = '\0';
 
-    Serial.print("Got message: ");
+    Serial.print(now());
+    Serial.print(" in  ");
     Serial.println(reinterpret_cast<const char *>(inbound_message.message));
 
     q_push(&state.q, &inbound_message);
@@ -107,7 +116,7 @@ void setup() {
     // Initialize Serial Monitor
     Serial.begin(115200);
 
-    // The Seeed S£s get quite hot. Reduce clock speed to keep cooler.
+    // The Seeed S3s get quite hot. Reduce clock speed to keep cooler.
     setCpuFrequencyMhz(80);
 
     q_init(&state.q, sizeof(inbound_t), 3, FIFO, true);
@@ -124,7 +133,7 @@ void setup() {
     start_espnow();
 
     // Start by initiating a WiFi connection, to start updating timeClient.
-    // Note that if the cvonnection attempt fails we will reboot (which is probably sensible).
+    // Note that if the connection attempt fails we will reboot (which is probably sensible).
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     state.start_connect_time = millis();
     state.state = state_t::waiting_for_wifi_connection;
@@ -141,9 +150,12 @@ void sanityCheck() {
     }
     Serial.println();
     timeClient.begin();
+    timeClient.
     for (int i = 0; i < 100; i++) {
         timeClient.update();
+        timeClient.
         if (timeClient.isTimeSet()) {
+            timeClient.
             break;
         }
 
@@ -151,7 +163,9 @@ void sanityCheck() {
     }
     Serial.print("Time: ");
     Serial.println(timeClient.getEpochTime());
+    timeClient.
     timeClient.end();
+    timeClient.
     WiFi.disconnect(false, true);
 #endif
 }
@@ -170,7 +184,8 @@ void loop() {
         Serial.println(LED_BUILTIN);
         Serial.print("CPU Freq: ");
         Serial.println(getCpuFrequencyMhz());
-        Serial.flush();
+        Serial.print("Xtal Freq: ");
+        Serial.println(getXtalFrequencyMhz());
     }
 
     mqttClient.loop();
@@ -180,8 +195,9 @@ void loop() {
     if (state.state == state_t::waiting_for_wifi_connection) {
         if (WiFi.status() == WL_CONNECTED) {
             state.state = state_t::got_wifi_connection;
-        } else if (state.start_connect_time + 45000 < millis()) {
-            restart("Waited 45s for WiFi - will discard and reboot");
+        } else if (state.start_connect_time + WIFI_WAIT_TIMEOUT_MILLIS < millis()) {
+            Serial.printf("%s: Waited too long for WiFi: WiFi.status() == %d\n", now(), WiFi.status());
+            restart("Timed out waiting for WiFi - will discard and reboot");
         }
 
         return;
@@ -223,6 +239,9 @@ void loop() {
         state.state = state_t::waiting_for_wifi_connection;
         return;
     }
+
+    // A little delay to reduce power.
+    delay(10);
 }
 
 bool connect_to_mqtt(){
@@ -277,12 +296,7 @@ void send_to_mqtt(inbound_t *inbound_message) {
         Serial.println(mqttClient.state());
     }
 
-    unsigned long now = millis();
-    Serial.print(now);
-    Serial.print(' ');
-    Serial.print(now - state.start_connect_time);
-    Serial.print(' ');
+    Serial.print(now());
+    Serial.print(" out ");
     Serial.println(reinterpret_cast<const char *>(output_buff));
 }
-
-
