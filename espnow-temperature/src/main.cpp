@@ -16,10 +16,12 @@
 #define DHT_DEBUG true
 #include <DHT.h>
 
+#define PRINT_TIME(X) { Serial.print(X ": "); Serial.println(millis()); }
+
 static DHT dht(4, DHT22);
 
 //uint8_t receiver_mac[6] = {0x34, 0x94, 0x54, 0x24, 0x95, 0xc8};     // esp32-receiver
-//uint8_t receiver_mac[6] = {0x30, 0x30, 0xf9, 0x18, 0x14, 0xf8};     // seeed esp32-s3 (bad?)
+//uint8_t receiver_mac[6] = {0x30, 0x30, 0xf9, 0x18, 0x14, 0xf8};     // seeed esp32-s3 number 1
 uint8_t receiver_mac[6] = {0x84, 0xfc, 0xe6, 0x78, 0x23, 0xec};     // seeed esp32-s3 number 2
 //uint8_t receiver_mac[6] = {0xdc, 0xa6, 0x32, 0xcc, 0xa6, 0x4d};     // pi wlan0
 //uint8_t receiver_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
@@ -62,7 +64,7 @@ void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
 #else
 void OnDataSent(uint8_t *mac_addr, uint8_t status) {
 #endif
-    print_payload();
+    //print_payload();
 
     payload.last_send_time_millis = millis() - payload.time_millis;
     payload.sequence++;
@@ -81,7 +83,7 @@ void OnDataSent(uint8_t *mac_addr, uint8_t status) {
         sleep_time_secs = 15 * 60;
     } else {
         // Bring the next time forwards, but delay by a random amount to prevent collisions.
-        sleep_time_secs = random(1 * 60, 2 * 60);
+        sleep_time_secs = random(45, 120);
     }
 
     Serial.print("Up: "); Serial.print(millis()); Serial.print(" millis. Sleeping "); Serial.print(sleep_time_secs); Serial.println(" secs");
@@ -90,10 +92,15 @@ void OnDataSent(uint8_t *mac_addr, uint8_t status) {
 
     // Instant does not wait for WiFi chip to idle.
     ESP.deepSleepInstant(sleep_time_secs * 1000000);
-    Serial.println("Woops!");
 }
 
 void setup() {
+    // Timing notes:
+    //  It usually takes about 72ms from boot to get to start of setup (ESP12F).
+    //  WiFi.mode(WIFI_STA); then takes about 100ms.
+    //  read DHT takes about 10ms.
+    //  send/ack espnow takes a couple of ms (or up to about 15ms if there is no receiver to ack).
+
     pinMode(LED_BUILTIN, OUTPUT);
     digitalWrite(LED_BUILTIN, HIGH);
 
@@ -143,7 +150,7 @@ void setup() {
     float h;
     float t;
 
-    // On first power on the DHT might not be ready).
+    // On first power on the DHT might not be ready.
     // NB - this only applies to power-on; it should be OK after deep sleep.
     for (int i = 0; i < (ESP.getResetInfoPtr()->reason == REASON_DEEP_SLEEP_AWAKE ? 2 : 10); i++) {
         h = dht.readHumidity(true);
@@ -155,12 +162,11 @@ void setup() {
         Serial.println(t);
 
         if (!isnan(t) && !isnan(h)) {
-            break;
+            send_message(h, t);
+            return;
         }
         delay(20);
     }
-
-    send_message(h, t);
 }
 
 void loop() {
@@ -175,16 +181,19 @@ static void send_message(float humidity, float temperature) {
     snprintf(buff, sizeof buff,
              "{ "
              "\"seq\": %d, "
+             "\"run\": %lu, "
              "\"success\": %d, "
              "\"fail\": %d, "
              "\"t\": %0.1f, "
              "\"h\": %0.1f "
              "}",
              payload.sequence,
+             millis(),
              payload.send_success,
              payload.send_fail,
              temperature,
              humidity
     );
+    printf("buff %s\n", buff);
     esp_now_send(receiver_mac, (uint8_t *)buff, strlen(buff)+1);
 }

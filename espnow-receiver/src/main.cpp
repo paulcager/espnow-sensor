@@ -84,6 +84,18 @@ const char *now() {
     return time_buff;
 }
 
+static unsigned long last_event_time = 0;
+void wifi_event(arduino_event_id_t event) {
+    Serial.print(millis() - last_event_time);
+    Serial.print(' ');
+    Serial.println(WiFi.eventName(event));
+    if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
+        Serial.print("IP: ");
+        Serial.println(WiFi.localIP());
+    }
+    last_event_time = millis();
+}
+
 // callback function that will be executed when data is received
 void OnDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
     inbound_t inbound_message;
@@ -127,6 +139,11 @@ void setup() {
 
     // Set device as a Wi-Fi Station
     WiFi.mode(WIFI_MODE_STA);
+
+    // Uncomment the following to add debugging of wireless timings.
+    // A rule of thumb is that STA_CONNECT takes about 2.5 seconds, STA_GOT_IP about 1.5.
+    WiFi.onEvent(wifi_event);
+
     sanityCheck();
     timeClient.begin();
 
@@ -136,6 +153,7 @@ void setup() {
     // Note that if the connection attempt fails we will reboot (which is probably sensible).
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     state.start_connect_time = millis();
+    last_event_time = millis();
     state.state = state_t::waiting_for_wifi_connection;
 }
 
@@ -180,12 +198,8 @@ void loop() {
         have_displayed = true;
         Serial.print("MAC: ");
         Serial.println(WiFi.macAddress());
-        Serial.print("LED: ");
-        Serial.println(LED_BUILTIN);
         Serial.print("CPU Freq: ");
         Serial.println(getCpuFrequencyMhz());
-        Serial.print("Xtal Freq: ");
-        Serial.println(getXtalFrequencyMhz());
     }
 
     mqttClient.loop();
@@ -195,8 +209,10 @@ void loop() {
     if (state.state == state_t::waiting_for_wifi_connection) {
         if (WiFi.status() == WL_CONNECTED) {
             state.state = state_t::got_wifi_connection;
+            //Serial.printf("Got wifi %s after %ld millis\n", WiFi.localIP().toString().c_str(), millis() - state.start_connect_time);
         } else if (state.start_connect_time + WIFI_WAIT_TIMEOUT_MILLIS < millis()) {
             Serial.printf("%s: Waited too long for WiFi: WiFi.status() == %d\n", now(), WiFi.status());
+            WiFi.printDiag(Serial);
             restart("Timed out waiting for WiFi - will discard and reboot");
         }
 
@@ -233,9 +249,17 @@ void loop() {
     }
 
     if (!q_isEmpty(&state.q)) {
-        //    uint8_t bssid[] = {0x10, 0xD7, 0xB0, 0x4A, 0x43, 0xDE};
-        WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+        // Note that attempting to avoid DHCP only saves about a second, so it is not attempted.
+//        uint8_t bssid[] = {0x12, 0xD7, 0xB0, 0x4A, 0x43, 0xDE};
+//        WiFi.config(
+//                IPAddress(192, 168, 0, 100),
+//                IPAddress(192, 168, 0, 1),
+//                IPAddress(8, 8, 8, 8),
+//                IPAddress(1, 1, 1, 1)
+//                );
+        WiFi.begin(WIFI_SSID, WIFI_PASSWORD, WIFI_CHANNEL, nullptr);
         state.start_connect_time = millis();
+        last_event_time = millis();
         state.state = state_t::waiting_for_wifi_connection;
         return;
     }
