@@ -106,6 +106,8 @@ void disconnect_from_mqtt();
 void sanityCheck();
 static httpd_handle_t start_webserver();
 
+static void led_task();
+
 void send_queued_message();
 
 static void restart(const char *why) {
@@ -182,7 +184,7 @@ void onEvent(arduino_event_id_t event) {
 
 // callback function that will be executed when data is received
 void OnDataRecv(const esp_now_recv_info* info, const uint8_t *incomingData, int len) {
-    uint8_t *mac = info->src_addr;
+    const uint8_t *mac = info->src_addr;
     inbound_t inbound_message;
 
     inbound_message.sequence = state.sequence++;
@@ -205,10 +207,6 @@ static void start_espnow(){
         restart("Error initializing ESP-NOW");
     }
 
-    // void (*)(const uint8_t*, const uint8_t*, int)'
-    // {aka 'void (*)(const unsigned char*, const unsigned char*, int)'} to
-    // 'esp_now_recv_cb_t'
-    // {aka 'void (*)(const esp_now_recv_info*, const unsigned char*, int)'}
     esp_now_register_recv_cb(&OnDataRecv);
     esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
 }
@@ -216,7 +214,7 @@ static void start_espnow(){
 void setup() {
 #ifndef ARDUINO_WT32_ETH01
     // The Seeed S3s get quite hot. Reduce clock speed to keep cooler.
-    //setCpuFrequencyMhz(80);
+    setCpuFrequencyMhz(80);
 #else
     setCpuFrequencyMhz(80);
 #endif
@@ -226,6 +224,8 @@ void setup() {
     // Initialize Serial Monitor
     Serial.begin(115200);
 
+    pinMode(2, OUTPUT);
+    pinMode(5, OUTPUT);
     q_init(&state.q, sizeof(inbound_t), 3, FIFO, true);
 
 #ifdef LED_PIN
@@ -316,6 +316,7 @@ void loop() {
         Serial.println(timeClient.getFormattedTime());
     }
 
+    led_task();
     mqttClient.loop();
 
 #ifdef LED_PIN
@@ -528,4 +529,17 @@ static httpd_handle_t start_webserver()
 
     ESP_LOGI(TAG, "Error starting server!");
     return NULL;
+}
+
+static void led_task() {
+    static unsigned long last_change = 0;
+    static int state = 0;
+    if (millis() < last_change + 1000) {
+        return;
+    }
+
+    last_change = millis();
+    digitalWrite(2, state);
+    state = (state+1) & 0x01;
+    digitalWrite(5, state);
 }
