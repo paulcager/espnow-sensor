@@ -47,10 +47,6 @@
 
 #include "../../secrets.h"
 
-#ifndef LED_BUILTIN
-#define LED_BUILTIN 2
-#endif
-
 // The maximum size of an esp-now packet is 255 bytes. We will be adding some other fields to it.
 // I could calculate the exact maximum size, but I can't be bothered.
 #define MAX_ESP_PACKET 255
@@ -185,7 +181,8 @@ void onEvent(arduino_event_id_t event) {
 }
 
 // callback function that will be executed when data is received
-void OnDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
+void OnDataRecv(const esp_now_recv_info* info, const uint8_t *incomingData, int len) {
+    uint8_t *mac = info->src_addr;
     inbound_t inbound_message;
 
     inbound_message.sequence = state.sequence++;
@@ -231,7 +228,9 @@ void setup() {
 
     q_init(&state.q, sizeof(inbound_t), 3, FIFO, true);
 
-    pinMode(LED_BUILTIN, OUTPUT);
+#ifdef LED_PIN
+    pinMode(LED_PIN, OUTPUT);
+#endif
 
     esp_efuse_mac_get_default(chipId);
     snprintf(host, sizeof(host),  HOSTNAME_FORMAT, chipId[4], chipId[5]);
@@ -319,7 +318,9 @@ void loop() {
 
     mqttClient.loop();
 
-    digitalWrite(LED_BUILTIN, state.state == state_t::waiting_for_esp_now ? HIGH : LOW);
+#ifdef LED_PIN
+    digitalWrite(LED_PIN, state.state == state_t::waiting_for_esp_now ? HIGH : LOW);
+#endif
 
     if (state.state == state_t::waiting_for_wifi_connection) {
         if (WiFi.status() == WL_CONNECTED) {
