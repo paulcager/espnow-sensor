@@ -35,15 +35,15 @@
 #include <esp_mac.h>
 #include <WiFi.h>
 #include <esp_wifi.h>
-#include <time.h>                       // time() ctime()
 #include <NTPClient.h>
 #include <WiFiUdp.h>
-
+#include <ESPmDNS.h>
+#include <PubSubClient.h>
 #include <esp_http_server.h>
 
-
-#include <PubSubClient.h>
 #include <cQueue.h>
+#include "Update.h"
+#include "esp_https_ota.h"
 
 #include "../../secrets.h"
 
@@ -54,6 +54,9 @@
 #define MESSAGE_LEN 512
 
 #define WIFI_WAIT_TIMEOUT_MILLIS 60000
+
+#define MAC_FORMAT "%02X:%02X:%02X:%02X:%02X:%02X"
+#define MAC_BYTES(MAC) (MAC[0]),(MAC[1]),(MAC[2]),(MAC[3]),(MAC[4]),(MAC[5])
 
 typedef struct {
     unsigned long arrival;
@@ -76,6 +79,10 @@ typedef struct {
     unsigned long last_send_time_millis;
     volatile uint32_t sequence;
     volatile uint32_t failed_mqtt_sends;
+    volatile int rssi;
+    volatile int noise_floor;
+    volatile unsigned int channel;
+
     volatile State state;
 
     Queue_t	q;
@@ -185,6 +192,13 @@ void onEvent(arduino_event_id_t event) {
 // callback function that will be executed when data is received
 void OnDataRecv(const esp_now_recv_info* info, const uint8_t *incomingData, int len) {
     const uint8_t *mac = info->src_addr;
+    const uint8_t *dest = info->des_addr;
+
+    wifi_pkt_rx_ctrl_t *ctrl = info->rx_ctrl;
+    state.channel = ctrl->channel;
+    state.rssi = ctrl->rssi;
+    state.noise_floor = ctrl->noise_floor;
+
     inbound_t inbound_message;
 
     inbound_message.sequence = state.sequence++;
@@ -195,7 +209,7 @@ void OnDataRecv(const esp_now_recv_info* info, const uint8_t *incomingData, int 
     inbound_message.message[len] = '\0';
 
     Serial.print(now());
-    Serial.print(" in  ");
+    Serial.printf(" in for " MAC_FORMAT " : ", MAC_BYTES(dest));
     Serial.println(reinterpret_cast<const char *>(inbound_message.message));
 
     q_push(&state.q, &inbound_message);
@@ -224,20 +238,13 @@ void setup() {
     // Initialize Serial Monitor
     Serial.begin(115200);
 
-    pinMode(2, OUTPUT);
-    pinMode(5, OUTPUT);
     q_init(&state.q, sizeof(inbound_t), 3, FIFO, true);
-
-#ifdef LED_PIN
-    pinMode(LED_PIN, OUTPUT);
-#endif
 
     esp_efuse_mac_get_default(chipId);
     snprintf(host, sizeof(host),  HOSTNAME_FORMAT, chipId[4], chipId[5]);
 
     mqttClient.setBufferSize(MESSAGE_LEN + MQTT_MAX_HEADER_SIZE + 2 + sizeof(MQTT_TOPIC) + 1 + 6);
 
-    //WiFi.onEvent(wifi_event);
     WiFi.onEvent(onEvent);
 
     Serial.println("ETH.begin():");
@@ -253,6 +260,8 @@ void setup() {
 
     configTime(0, 0, "pool.ntp.org", "2.uk.pool.ntp.org", "3.europe.pool.ntp.org");
     timeClient.begin();
+
+    MDNS.begin(host);
 
     start_espnow();
     start_webserver();
@@ -300,28 +309,32 @@ void loop() {
         // the serial connection is ready (especially for ESP32-S3). We may also have the timeClient
         // available by then (for wired connections).
         have_displayed = true;
+
+        uint8_t baseMac[6];
+        (void)esp_wifi_get_mac(WIFI_IF_STA, baseMac);
+
         Serial.print("Starting up ");
         Serial.println(ESP.getChipModel());
-        Serial.print("Host ");
+        Serial.print("Host:           ");
         Serial.println(host);
-        Serial.print("ethAvailable=");
+        Serial.print("ethAvailable:   ");
         Serial.println(ethAvailable);
-        Serial.print("STA MAC: ");
-        Serial.println(WiFi.macAddress());
-        Serial.print("ETH MAC: ");
+        Serial.print("BASE MAC:       ");
+        Serial.printf(MAC_FORMAT "\r\n", MAC_BYTES(baseMac));
+        Serial.print("ETH MAC:        ");
         Serial.println(ETH.macAddress());
-        Serial.print("CPU Freq: ");
+        Serial.print("CPU Freq (Mhz): ");
         Serial.println(getCpuFrequencyMhz());
-        Serial.print("Time: ");
+        Serial.print("Time:           ");
         Serial.println(timeClient.getFormattedTime());
+        if (ethConnected) {
+            Serial.print("IP:             ");
+            Serial.println(ETH.localIP().toString());
+        }
     }
 
     led_task();
     mqttClient.loop();
-
-#ifdef LED_PIN
-    digitalWrite(LED_PIN, state.state == state_t::waiting_for_esp_now ? HIGH : LOW);
-#endif
 
     if (state.state == state_t::waiting_for_wifi_connection) {
         if (WiFi.status() == WL_CONNECTED) {
@@ -395,7 +408,7 @@ void send_queued_message() {
 }
 
 bool connect_to_mqtt(){
-    if (!mqttClient.connect("esp-now", MQTT_USER, MQTT_PASSWORD)) {
+    if (!mqttClient.connect(host, MQTT_USER, MQTT_PASSWORD)) {
         Serial.print("MQTT connection failed! Host=");
         Serial.print(MQTT_BROKER);
         Serial.print(":");
@@ -411,9 +424,6 @@ bool connect_to_mqtt(){
 void disconnect_from_mqtt() {
     mqttClient.disconnect();
 }
-
-#define MAC_FORMAT "%02X:%02X:%02X:%02X:%02X:%02X"
-#define MAC_BYTES(MAC) (MAC[0]),(MAC[1]),(MAC[2]),(MAC[3]),(MAC[4]),(MAC[5])
 
 void send_to_mqtt(inbound_t *inbound_message) {
     static uint8_t output_buff[MESSAGE_LEN];
@@ -450,10 +460,13 @@ void send_to_mqtt(inbound_t *inbound_message) {
         state.failed_mqtt_sends++;
         Serial.print("mqttClient.publish failed: state=");
         Serial.print(mqttClient.state());
+        Serial.print(", write_error=");
+        Serial.print(mqttClient.getWriteError());
         Serial.print(", output_len=");
         Serial.print(output_len);
         Serial.print(", buffer_size=");
         Serial.println(mqttClient.getBufferSize());
+        return;
     }
 
     Serial.print(now());
@@ -504,7 +517,31 @@ static esp_err_t metrics_get_handler(httpd_req_t *req) {
              esp_get_free_heap_size());
     httpd_resp_sendstr_chunk(req, metrics_buff);
 
-    // Indicate sent all chunks.
+    // There's no sensible default for rssi etc. Make sure we don't send zeros before we get the first message.
+    if (state.sequence > 0) {
+        snprintf(metrics_buff, sizeof metrics_buff - 1,
+                 "# TYPE espnow_receiver_rssi gauge\n"
+                 "espnow_receiver_rssi{receiver=\"%s\"} %d\n",
+                 host,
+                 state.rssi);
+        httpd_resp_sendstr_chunk(req, metrics_buff);
+
+        snprintf(metrics_buff, sizeof metrics_buff - 1,
+                 "# TYPE espnow_receiver_noise_floor gauge\n"
+                 "espnow_receiver_noise_floor{receiver=\"%s\"} %d\n",
+                 host,
+                 state.noise_floor);
+        httpd_resp_sendstr_chunk(req, metrics_buff);
+
+        snprintf(metrics_buff, sizeof metrics_buff - 1,
+                 "# TYPE espnow_receiver_channel gauge\n"
+                 "espnow_receiver_channel{receiver=\"%s\"} %u\n",
+                 host,
+                 state.channel);
+        httpd_resp_sendstr_chunk(req, metrics_buff);
+    }
+
+    // Indicate no more chunks.
     httpd_resp_sendstr_chunk(req, NULL);
     return ESP_OK;
 }
@@ -513,6 +550,80 @@ static const httpd_uri_t metrics = {
         .uri       = "/metrics",
         .method    = HTTP_GET,
         .handler   = metrics_get_handler,
+};
+
+// /home/paul/.platformio/penv/bin/pio run -e evo-eth01 && curl -v  -H "Content-Type: application/octet-stream" --data-binary "@.pio/build/evo-eth01/firmware.bin" http://192.168.0.96/ota
+static esp_err_t ota_upload_handler(httpd_req_t *req) {
+    const size_t BUFF_SIZE = 4096;
+    long max_image_size = (ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000;
+    uint8_t *buffer = (uint8_t *)(malloc(BUFF_SIZE));
+    if (buffer == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    size_t remaining = req->content_len;
+    Serial.printf("Size of image: %ld\r\n", (long)remaining);
+    if (!Update.begin(remaining)) {
+        free(buffer);
+        return ESP_FAIL;
+    }
+
+    int count = 0;
+    while (remaining > 0) {
+        int read = httpd_req_recv(req, (char *)buffer, BUFF_SIZE);
+        //Serial.printf("Read: %ld\r\n", (long)read);
+
+        if (read <= 0) {
+            Update.abort();
+            free(buffer);
+            return read == 0 ? ESP_FAIL : read;
+        }
+
+        if (Update.write(buffer, read) != read) {
+            Update.printError(Serial);
+            Update.abort();
+            free(buffer);
+            return ESP_FAIL;
+        }
+
+        remaining -= read;
+        Serial.print('.');
+        count++;
+
+        if (count % 80) {
+            Serial.println();
+        }
+//        Serial.printf("Remaining: %ld\r\n", (long)remaining);
+    }
+
+    Update.end(true);
+    Serial.println();
+    httpd_resp_sendstr(req, "Rebooting...\r\n");
+    free(buffer);
+    delay(500);
+    ESP.restart();
+
+
+    return ESP_OK;
+}
+
+static const httpd_uri_t ota = {
+        .uri       = "/ota",
+        .method    = HTTP_POST,
+        .handler   = ota_upload_handler,
+};
+
+static esp_err_t reboot_handler(httpd_req_t *req) {
+    httpd_resp_sendstr(req, "Rebooting...\r\n");
+    delay(500);
+    ESP.restart();
+    return ESP_OK;
+}
+
+static const httpd_uri_t reboot = {
+        .uri       = "/reboot",
+        .method    = HTTP_POST,
+        .handler   = reboot_handler,
 };
 
 static httpd_handle_t start_webserver()
@@ -524,6 +635,8 @@ static httpd_handle_t start_webserver()
     ESP_LOGI(TAG, "Starting server on port: '%d'", config.server_port);
     if (httpd_start(&server, &config) == ESP_OK) {
         httpd_register_uri_handler(server, &metrics);
+        httpd_register_uri_handler(server, &ota);
+        httpd_register_uri_handler(server, &reboot);
         return server;
     }
 
@@ -532,14 +645,12 @@ static httpd_handle_t start_webserver()
 }
 
 static void led_task() {
-    static unsigned long last_change = 0;
-    static int state = 0;
-    if (millis() < last_change + 1000) {
-        return;
+#ifdef LED_PIN
+    static bool initialised = false;
+    if (!initialised) {
+        pinMode(LED_PIN, OUTPUT);
     }
 
-    last_change = millis();
-    digitalWrite(2, state);
-    state = (state+1) & 0x01;
-    digitalWrite(5, state);
+    digitalWrite(LED_PIN, state.state == state_t::waiting_for_esp_now ? HIGH : LOW);
+#endif
 }

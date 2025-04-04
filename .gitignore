@@ -54,3 +54,4 @@ dkms.conf
 .idea
 
 secrets.h
+**/.pio
