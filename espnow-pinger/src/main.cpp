@@ -41,9 +41,9 @@ void setup() {
     if (esp_now_init() != ESP_OK) {
         Serial.println("Error initializing ESP-NOW");
         return; // Stop execution if initialization fails
-    } else {
-        Serial.println("ESP-NOW Initialized Successfully");
     }
+
+    Serial.println("ESP-NOW Initialized Successfully");
 
     // Register the send callback function
     esp_now_register_send_cb(OnDataSent);

@@ -90,8 +90,6 @@ typedef struct {
 
 static state_t state = {};
 
-static uint8_t chipId[8];
-
 
 static WiFiClient wifi_client;
 static PubSubClient mqttClient(MQTT_BROKER, MQTT_PORT, wifi_client);
@@ -105,6 +103,8 @@ static volatile bool ethConnected = false;
 #define HOSTNAME_PREFIX "espnow-receiver-"
 #define HOSTNAME_FORMAT (HOSTNAME_PREFIX "%02X%02X")
 static char host[sizeof(HOSTNAME_PREFIX) + 4 + 1];
+static uint8_t baseMac[6];
+static uint8_t chipId[8];
 
 bool connect_to_mqtt();
 void send_to_mqtt(inbound_t *inbound_message);
@@ -242,6 +242,7 @@ void setup() {
 
     esp_efuse_mac_get_default(chipId);
     snprintf(host, sizeof(host),  HOSTNAME_FORMAT, chipId[4], chipId[5]);
+    (void)esp_wifi_get_mac(WIFI_IF_STA, baseMac);
 
     mqttClient.setBufferSize(MESSAGE_LEN + MQTT_MAX_HEADER_SIZE + 2 + sizeof(MQTT_TOPIC) + 1 + 6);
 
@@ -309,9 +310,6 @@ void loop() {
         // the serial connection is ready (especially for ESP32-S3). We may also have the timeClient
         // available by then (for wired connections).
         have_displayed = true;
-
-        uint8_t baseMac[6];
-        (void)esp_wifi_get_mac(WIFI_IF_STA, baseMac);
 
         Serial.print("Starting up ");
         Serial.println(ESP.getChipModel());
@@ -498,8 +496,9 @@ static esp_err_t metrics_get_handler(httpd_req_t *req) {
 
     snprintf(metrics_buff, sizeof metrics_buff - 1,
              "# TYPE espnow_receiver_uptime gauge\n"
-             "espnow_receiver_uptime{receiver=\"%s\"} %f\n",
+             "espnow_receiver_uptime{receiver=\"%s\", chip=\"%s\"} %f\n",
              host,
+             ESP.getChipModel(),
              (double)millis() / 1000.0);
     httpd_resp_sendstr_chunk(req, metrics_buff);
 
@@ -538,6 +537,16 @@ static esp_err_t metrics_get_handler(httpd_req_t *req) {
                  "espnow_receiver_channel{receiver=\"%s\"} %u\n",
                  host,
                  state.channel);
+        httpd_resp_sendstr_chunk(req, metrics_buff);
+    } else {
+        uint8_t chan;
+        esp_wifi_get_channel(&chan, NULL);
+
+        snprintf(metrics_buff, sizeof metrics_buff - 1,
+                 "# TYPE espnow_receiver_channel gauge\n"
+                 "espnow_receiver_channel{receiver=\"%s\"} %u\n",
+                 host,
+                 chan);
         httpd_resp_sendstr_chunk(req, metrics_buff);
     }
 
@@ -590,16 +599,19 @@ static esp_err_t ota_upload_handler(httpd_req_t *req) {
         Serial.print('.');
         count++;
 
-        if (count % 80) {
+        if ((count % 80) == 0) {
             Serial.println();
         }
 //        Serial.printf("Remaining: %ld\r\n", (long)remaining);
     }
 
+    free(buffer);
     Update.end(true);
     Serial.println();
-    httpd_resp_sendstr(req, "Rebooting...\r\n");
-    free(buffer);
+    String msg("Upload MD5: ");
+    msg.concat(Update.md5String());
+    msg.concat("\r\nRebooting.....\r\n");
+    httpd_resp_sendstr(req, msg.c_str());
     delay(500);
     ESP.restart();
 
@@ -625,6 +637,29 @@ static const httpd_uri_t reboot = {
         .method    = HTTP_POST,
         .handler   = reboot_handler,
 };
+
+#ifdef TODO
+static esp_err_t info_handler(httpd_req_t *req) {
+    Serial.print("Starting up ");
+    Serial.println(ESP.getChipModel());
+    Serial.print("Host:           ");
+    Serial.println(host);
+    Serial.print("ethAvailable:   ");
+    Serial.println(ethAvailable);
+    Serial.print("BASE MAC:       ");
+    Serial.printf(MAC_FORMAT "\r\n", MAC_BYTES(baseMac));
+    Serial.print("ETH MAC:        ");
+    Serial.println(ETH.macAddress());
+    Serial.print("CPU Freq (Mhz): ");
+    Serial.println(getCpuFrequencyMhz());
+    Serial.print("Time:           ");
+    Serial.println(timeClient.getFormattedTime());
+    if (ethConnected) {
+        Serial.print("IP:             ");
+        Serial.println(ETH.localIP().toString());
+    }
+}
+#endif
 
 static httpd_handle_t start_webserver()
 {
