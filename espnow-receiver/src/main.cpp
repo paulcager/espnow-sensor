@@ -29,6 +29,8 @@
 
 #include <Arduino.h>
 
+#include "version.h"
+
 #include "ETH.h"
 
 #include <esp_now.h>
@@ -232,11 +234,11 @@ void setup() {
 #else
     setCpuFrequencyMhz(80);
 #endif
-
     enableLoopWDT();
 
     // Initialize Serial Monitor
     Serial.begin(115200);
+    Serial.println(APP " starting. Commit " VERSION_COMMIT_HASH ", built " VERSION_TIMESTAMP);
 
     q_init(&state.q, sizeof(inbound_t), 3, FIFO, true);
 

@@ -4,6 +4,8 @@
 //#define DEBUG_HTTPCLIENT(...) Serial.printf(__VA_ARGS__)
 //#define DEBUG_WIFI_GENERIC(...) Serial.printf(__VA_ARGS__)
 
+#include "version.h"
+
 #ifdef ESP32
 #include <esp_now.h>
 #include <WiFi.h>

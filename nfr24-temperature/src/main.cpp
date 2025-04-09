@@ -1,5 +1,7 @@
 #include <Arduino.h>
 
+#include "version.h"
+
 #include <SPI.h>
 #include "printf.h"
 #include "RF24.h"
