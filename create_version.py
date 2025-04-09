@@ -9,6 +9,13 @@ result = subprocess.run(
 )
 commit_hash = result.stdout.strip()
 
+result = subprocess.run(
+    ["git", "describe", "--tags", "--dirty", "--always"],
+    stdout=subprocess.PIPE,
+    text=True
+)
+tag = result.stdout.strip()
+
 dirty_check = subprocess.run(
     ["git", "status", "--porcelain"],
     stdout=subprocess.PIPE,
@@ -28,9 +35,11 @@ current_directory = os.path.basename(os.getcwd())
 
 define_output = (
     f"#define APP \"{current_directory}\"\n"
+    f"#define VERSION \"{tag}\"\n"
     f"#define VERSION_COMMIT_HASH \"{commit_hash}{is_dirty}\"\n"
     f"#define VERSION_TIMESTAMP \"{current_timestamp}\"\n"
     f"#define VERSION_BRANCH \"{branch_name}\"\n"
+    f"#define APP_BANNER APP \" v\" VERSION \" (\" VERSION_COMMIT_HASH \") \" VERSION_TIMESTAMP\n"
 )
 
 with open("include/version.h", "w") as file:

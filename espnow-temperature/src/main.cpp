@@ -91,9 +91,13 @@ void check_updates() {
     Serial.printf("\nAssigned IP address: %s\n", WiFi.localIP().toString().c_str());
 
     // Read etag (if any) of last applied update.
+#ifdef ESP8266
     LittleFSConfig fsconfig(true);
     LittleFS.setConfig(fsconfig);
     LittleFS.begin();
+#else
+    LittleFS.begin(true);
+#endif
     File file = LittleFS.open("/bin-etag", "r");
     uint8_t etag[128];
     memset(etag, '\0', sizeof etag);

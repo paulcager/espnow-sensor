@@ -38,11 +38,13 @@
 #include <WiFi.h>
 #include <esp_wifi.h>
 #include <NTPClient.h>
+#include <HTTPClient.h>
 #include <WiFiUdp.h>
 #include <ESPmDNS.h>
 #include <PubSubClient.h>
 #include <esp_http_server.h>
-
+#include "FS.h"
+#include <LittleFS.h>
 #include <cQueue.h>
 #include "Update.h"
 #include "esp_https_ota.h"
@@ -114,10 +116,10 @@ void disconnect_from_mqtt();
 
 void sanityCheck();
 static httpd_handle_t start_webserver();
-
 static void led_task();
-
-void send_queued_message();
+static void send_queued_message();
+static void check_updates();
+static int httpGet(HTTPClient &http, char *url, const char *etag);
 
 static void restart(const char *why) {
     Serial.println(why);
@@ -234,11 +236,10 @@ void setup() {
 #else
     setCpuFrequencyMhz(80);
 #endif
-    enableLoopWDT();
 
     // Initialize Serial Monitor
     Serial.begin(115200);
-    Serial.println(APP " starting. Commit " VERSION_COMMIT_HASH ", built " VERSION_TIMESTAMP);
+    Serial.println(APP_BANNER);
 
     q_init(&state.q, sizeof(inbound_t), 3, FIFO, true);
 
@@ -255,7 +256,7 @@ void setup() {
     Serial.print("ETH.begin returned:");
     Serial.println(ethAvailable);
 
-    // Set device as a Wi-Fi Station so it can receive espnpw
+    // Set device as a Wi-Fi Station, so it can receive espnpw
     WiFi.mode(WIFI_MODE_STA);
     // Uncomment the following to add debugging of wireless timings.
     // A rule of thumb is that STA_CONNECT takes about 2.5 seconds, STA_GOT_IP about 1.5.
@@ -304,8 +305,9 @@ void sanityCheck() {
 }
 
 void loop() {
-    static unsigned long display_time = 10000;
     static bool have_displayed = false;
+    static unsigned long display_time = 10000;
+    static unsigned long next_check_updates = 0;
 
     if (!have_displayed && millis() > display_time) {
         // Delay printing of startup messages until we've been up for a few seconds and
@@ -331,6 +333,14 @@ void loop() {
             Serial.print("IP:             ");
             Serial.println(ETH.localIP().toString());
         }
+
+        return;
+    }
+
+    if (millis() >= next_check_updates && have_displayed && (WiFi.isConnected() || ethConnected)) {
+        next_check_updates = millis() + (1000 * 60 * 60);
+        check_updates();
+        return;
     }
 
     led_task();
@@ -392,7 +402,7 @@ void loop() {
 // If there's a queued message make sure we are connected to MQTT, pop it and
 // send to MQTT. Only send one message at a time, so that we don't starve the
 // MQTT client loop function.
-void send_queued_message() {
+static void send_queued_message() {
     if (q_isEmpty(&state.q)) {
         return;
     }
@@ -690,4 +700,119 @@ static void led_task() {
 
     digitalWrite(LED_PIN, state.state == state_t::waiting_for_esp_now ? HIGH : LOW);
 #endif
+}
+
+static void check_updates() {
+    // Read etag (if any) of last applied update.
+    if (!LittleFS.begin(true)) {
+        Serial.println("LittleFS Mount Failed");
+        return;
+    }
+
+    File file = LittleFS.open("/bin-etag", "r");
+    uint8_t etag[128];
+    memset(etag, '\0', sizeof etag);
+
+    if (file) {
+        int etag_size = file.read(etag, sizeof etag);
+        Serial.printf("Etag read(%d): %s\n", etag_size, etag);
+        file.close();
+    }
+
+    // Query for any newer firmware.
+    char url[128];
+
+    HTTPClient http;
+
+    // First check for host-specific firmware.
+    snprintf(url, sizeof url, "http://192.168.0.2:18080/%s", host);
+    int ret = httpGet(http, url, reinterpret_cast<const char *>(etag));
+    if (ret == 404) {
+        // No host-specific. Try generic instead.
+        http.end();
+
+        // The URL we query is /appname/chipmodel. For ESP8266 I can't see any way to get the chip model.
+        // We could also vary it depending on size of flash.
+#ifdef ESP8266
+        snprintf(url, sizeof url, "http://192.168.0.2:18080/%s/esp8266", APP);
+#else
+        snprintf(url, sizeof url, "http://192.168.0.2:18080/%s/%s", APP, ESP.getChipModel());
+#endif
+
+        ret = httpGet(http, url, reinterpret_cast<const char *>(etag));
+    }
+
+    String returned_etag = http.header("Etag");
+    Serial.printf("Etag returned: %s\n", returned_etag.c_str());
+    Serial.printf("Last Modified: %s\n", http.header("Last-Modified").c_str());
+    Serial.printf("Content-Length: %d\n", http.getSize());
+
+    if (ret != 200 || http.getSize() <= 0) {
+        // Expected statuses:
+        //  304 Not Modified
+        //  404 Not Found
+        // No matter if it is an expected or unexpected failure, the action is the
+        // same: abandon updating. We also need to know the size of the file to
+        // do the update (chunked encoding is not supported).
+
+        http.end();
+        LittleFS.end();
+        return;
+    }
+
+    WiFiClient stream = http.getStream();
+    if (!Update.begin(http.getSize())) {
+        Serial.println("Count not update\n");
+        http.end();
+        LittleFS.end();
+        return;
+    }
+
+    size_t written = Update.writeStream(http.getStream());
+    Serial.printf("Written %d, expect remaining to be zero: %d\n", written, Update.remaining());
+    Update.end();
+    Serial.printf("Update %s: status = %d\n", Update.hasError() ? "FAILED": "OK", Update.getError());
+
+    http.end();
+
+    if (Update.hasError()) {
+        LittleFS.end();
+        // No need to reboot.
+        return;
+    }
+
+    if (!returned_etag.isEmpty() && !Update.hasError()) {
+        // We don't appear to be able to open the file as read-write, hence why we close and re-open.
+        File file = LittleFS.open("/bin-etag", "w");
+        size_t written = file.write((uint8_t *)returned_etag.c_str(), returned_etag.length());
+        Serial.printf("Saved etag. written=%d out of %d for %s\n", written,returned_etag.length(), returned_etag.c_str());
+        file.close();
+    }
+
+    LittleFS.end();
+    Serial.printf("MD5: %s\n", Update.md5String().c_str());
+    Serial.println("Restarting....");
+    delay(250);
+    ESP.restart();
+}
+
+static int httpGet(HTTPClient &http, char *url, const char *etag) {
+    http.begin(wifi_client, url);
+
+    // Adding a Host header won't work. See https://stackoverflow.com/a/68714543/683825. Also,
+    // VM won't allow DNS responses that resolve to local addresses. WTF?
+    // Instead, I have configured Caddy to serve firmware on an additional port: 18080
+    // http.addHeader("Host", "firmware.paulcager.org");
+
+    if (etag[0] != '\0') {
+        http.addHeader("If-None-Match", etag);
+    }
+
+    // Configure http to save any interesting headers.
+    const char *headerKeys[] = {"Etag", "Last-Modified"};
+    http.collectHeaders(headerKeys, (sizeof(headerKeys)) / (sizeof(char *)));
+
+    int ret = http.GET();
+    Serial.printf("GET %s: %d\n", url, ret);
+    return ret;
 }
