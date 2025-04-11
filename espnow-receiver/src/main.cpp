@@ -100,6 +100,7 @@ static PubSubClient mqttClient(MQTT_BROKER, MQTT_PORT, wifi_client);
 // Define NTP Client to get time
 static WiFiUDP ntpUDP;
 static NTPClient timeClient(ntpUDP);
+static void init_etag();
 
 static bool ethAvailable = false;      // True if MAC/PHY exist; does not need cable plugged in.
 static volatile bool ethConnected = false;
@@ -109,6 +110,7 @@ static volatile bool ethConnected = false;
 static char host[sizeof(HOSTNAME_PREFIX) + 4 + 1];
 static uint8_t baseMac[6];
 static uint8_t chipId[8];
+static uint8_t etag[128];
 
 bool connect_to_mqtt();
 void send_to_mqtt(inbound_t *inbound_message);
@@ -245,7 +247,13 @@ void setup() {
 
     esp_efuse_mac_get_default(chipId);
     snprintf(host, sizeof(host),  HOSTNAME_FORMAT, chipId[4], chipId[5]);
-    (void)esp_wifi_get_mac(WIFI_IF_STA, baseMac);
+
+    // Read etag (if any) of last applied update.
+    if (LittleFS.begin(true)) {
+        init_etag();
+    } else {
+        Serial.println("LittleFS Mount Failed");
+    }
 
     mqttClient.setBufferSize(MESSAGE_LEN + MQTT_MAX_HEADER_SIZE + 2 + sizeof(MQTT_TOPIC) + 1 + 6);
 
@@ -261,6 +269,8 @@ void setup() {
     // Uncomment the following to add debugging of wireless timings.
     // A rule of thumb is that STA_CONNECT takes about 2.5 seconds, STA_GOT_IP about 1.5.
     //sanityCheck();
+
+    (void)esp_wifi_get_mac(WIFI_IF_STA, baseMac);
 
     configTime(0, 0, "pool.ntp.org", "2.uk.pool.ntp.org", "3.europe.pool.ntp.org");
     timeClient.begin();
@@ -304,6 +314,46 @@ void sanityCheck() {
 #endif
 }
 
+char *get_info() {
+    static char *buff = NULL;
+    static size_t buff_size;
+
+    if (buff == NULL) {
+        buff_size = 512;
+        buff = static_cast<char *>(malloc(512));
+        if (buff == NULL) {
+            return "Out of Memory";
+        }
+    }
+
+    // TODO - reallocate buff if too small? Not that it will be.
+    snprintf(buff, buff_size,
+                        "%s\n"
+                        "Chip:               %s\r\n"
+                        "ETAG:               %s\r\n"
+                        "Uptime (millis):    %lu\r\n"
+                        "Host:               %s\r\n"
+                        "ethAvailable:       %d\r\n"
+                        "BASE MAC:           " MAC_FORMAT "\r\n"
+                        "ETH MAC:            %s\r\n"
+                        "CPU Freq (Mhz):     %d\r\n"
+                        "Time:               %s\r\n"
+                        "IP:                 %s\r\n",
+                        APP_BANNER,
+                        ESP.getChipModel(),
+                        etag,
+                        millis(),
+                        host,
+                        ethAvailable,
+                        MAC_BYTES(baseMac),
+                        ETH.macAddress().c_str(),
+                        getCpuFrequencyMhz(),
+                        timeClient.getFormattedTime().c_str(),
+                        ethConnected ? ETH.localIP().toString().c_str() : "None"
+    );
+    return buff;
+}
+
 void loop() {
     static bool have_displayed = false;
     static unsigned long display_time = 10000;
@@ -314,26 +364,8 @@ void loop() {
         // the serial connection is ready (especially for ESP32-S3). We may also have the timeClient
         // available by then (for wired connections).
         have_displayed = true;
-
         Serial.print("Starting up ");
-        Serial.println(ESP.getChipModel());
-        Serial.print("Host:           ");
-        Serial.println(host);
-        Serial.print("ethAvailable:   ");
-        Serial.println(ethAvailable);
-        Serial.print("BASE MAC:       ");
-        Serial.printf(MAC_FORMAT "\r\n", MAC_BYTES(baseMac));
-        Serial.print("ETH MAC:        ");
-        Serial.println(ETH.macAddress());
-        Serial.print("CPU Freq (Mhz): ");
-        Serial.println(getCpuFrequencyMhz());
-        Serial.print("Time:           ");
-        Serial.println(timeClient.getFormattedTime());
-        if (ethConnected) {
-            Serial.print("IP:             ");
-            Serial.println(ETH.localIP().toString());
-        }
-
+        Serial.println(get_info());
         return;
     }
 
@@ -488,28 +520,30 @@ void send_to_mqtt(inbound_t *inbound_message) {
 static esp_err_t metrics_get_handler(httpd_req_t *req) {
     // TODO - check buffer overflow
     static char metrics_buff[1024];
+    char name[5];
+    snprintf(name, sizeof name, "%02X%02X", baseMac[4], baseMac[5]);
 
     httpd_resp_set_type(req, "text/plain");
 
-    // TODO - counts for each sender.
+    // TODO - counts for each sender? Maybe.
     snprintf(metrics_buff, sizeof metrics_buff - 1,
              "# TYPE espnow_receiver_message_count_total counter\n"
              "espnow_receiver_message_count_total{receiver=\"%s\"} %d\n",
-             host,
+             name,
              state.sequence);
     httpd_resp_sendstr_chunk(req, metrics_buff);
 
     snprintf(metrics_buff, sizeof metrics_buff - 1,
              "# TYPE espnow_receiver_failed_mqtt_count_total counter\n"
              "espnow_receiver_failed_mqtt_count_total{receiver=\"%s\"} %d\n",
-             host,
+             name,
              state.failed_mqtt_sends);
     httpd_resp_sendstr_chunk(req, metrics_buff);
 
     snprintf(metrics_buff, sizeof metrics_buff - 1,
              "# TYPE espnow_receiver_uptime gauge\n"
              "espnow_receiver_uptime{receiver=\"%s\", chip=\"%s\"} %f\n",
-             host,
+             name,
              ESP.getChipModel(),
              (double)millis() / 1000.0);
     httpd_resp_sendstr_chunk(req, metrics_buff);
@@ -517,14 +551,14 @@ static esp_err_t metrics_get_handler(httpd_req_t *req) {
     snprintf(metrics_buff, sizeof metrics_buff - 1,
              "# TYPE espnow_receiver_message_age gauge\n"
              "espnow_receiver_message_age{receiver=\"%s\"} %f\n",
-             host,
+             name,
              ((double)(millis() - state.last_send_time_millis)) / 1000.0);
     httpd_resp_sendstr_chunk(req, metrics_buff);
 
     snprintf(metrics_buff, sizeof metrics_buff - 1,
              "# TYPE espnow_receiver_heap_free_bytes gauge\n"
              "espnow_receiver_heap_free_bytes{receiver=\"%s\"} %u\n",
-             host,
+             name,
              esp_get_free_heap_size());
     httpd_resp_sendstr_chunk(req, metrics_buff);
 
@@ -533,21 +567,21 @@ static esp_err_t metrics_get_handler(httpd_req_t *req) {
         snprintf(metrics_buff, sizeof metrics_buff - 1,
                  "# TYPE espnow_receiver_rssi gauge\n"
                  "espnow_receiver_rssi{receiver=\"%s\"} %d\n",
-                 host,
+                 name,
                  state.rssi);
         httpd_resp_sendstr_chunk(req, metrics_buff);
 
         snprintf(metrics_buff, sizeof metrics_buff - 1,
                  "# TYPE espnow_receiver_noise_floor gauge\n"
                  "espnow_receiver_noise_floor{receiver=\"%s\"} %d\n",
-                 host,
+                 name,
                  state.noise_floor);
         httpd_resp_sendstr_chunk(req, metrics_buff);
 
         snprintf(metrics_buff, sizeof metrics_buff - 1,
                  "# TYPE espnow_receiver_channel gauge\n"
                  "espnow_receiver_channel{receiver=\"%s\"} %u\n",
-                 host,
+                 name,
                  state.channel);
         httpd_resp_sendstr_chunk(req, metrics_buff);
     } else {
@@ -557,7 +591,7 @@ static esp_err_t metrics_get_handler(httpd_req_t *req) {
         snprintf(metrics_buff, sizeof metrics_buff - 1,
                  "# TYPE espnow_receiver_channel gauge\n"
                  "espnow_receiver_channel{receiver=\"%s\"} %u\n",
-                 host,
+                 name,
                  chan);
         httpd_resp_sendstr_chunk(req, metrics_buff);
     }
@@ -650,28 +684,16 @@ static const httpd_uri_t reboot = {
         .handler   = reboot_handler,
 };
 
-#ifdef TODO
 static esp_err_t info_handler(httpd_req_t *req) {
-    Serial.print("Starting up ");
-    Serial.println(ESP.getChipModel());
-    Serial.print("Host:           ");
-    Serial.println(host);
-    Serial.print("ethAvailable:   ");
-    Serial.println(ethAvailable);
-    Serial.print("BASE MAC:       ");
-    Serial.printf(MAC_FORMAT "\r\n", MAC_BYTES(baseMac));
-    Serial.print("ETH MAC:        ");
-    Serial.println(ETH.macAddress());
-    Serial.print("CPU Freq (Mhz): ");
-    Serial.println(getCpuFrequencyMhz());
-    Serial.print("Time:           ");
-    Serial.println(timeClient.getFormattedTime());
-    if (ethConnected) {
-        Serial.print("IP:             ");
-        Serial.println(ETH.localIP().toString());
-    }
+    httpd_resp_sendstr(req, get_info());
+    return ESP_OK;
 }
-#endif
+
+static const httpd_uri_t info = {
+        .uri       = "/info",
+        .method    = HTTP_GET,
+        .handler   = info_handler,
+};
 
 static httpd_handle_t start_webserver()
 {
@@ -684,6 +706,7 @@ static httpd_handle_t start_webserver()
         httpd_register_uri_handler(server, &metrics);
         httpd_register_uri_handler(server, &ota);
         httpd_register_uri_handler(server, &reboot);
+        httpd_register_uri_handler(server, &info);
         return server;
     }
 
@@ -702,23 +725,18 @@ static void led_task() {
 #endif
 }
 
-static void check_updates() {
-    // Read etag (if any) of last applied update.
-    if (!LittleFS.begin(true)) {
-        Serial.println("LittleFS Mount Failed");
-        return;
-    }
-
-    File file = LittleFS.open("/bin-etag", "r");
-    uint8_t etag[128];
+static void init_etag() {
     memset(etag, '\0', sizeof etag);
 
+    File file = LittleFS.open("/bin-etag", "r");
     if (file) {
         int etag_size = file.read(etag, sizeof etag);
         Serial.printf("Etag read(%d): %s\n", etag_size, etag);
-        file.close();
     }
+    file.close();
+}
 
+static void check_updates() {
     // Query for any newer firmware.
     char url[128];
 
@@ -756,7 +774,6 @@ static void check_updates() {
         // do the update (chunked encoding is not supported).
 
         http.end();
-        LittleFS.end();
         return;
     }
 
@@ -764,7 +781,6 @@ static void check_updates() {
     if (!Update.begin(http.getSize())) {
         Serial.println("Count not update\n");
         http.end();
-        LittleFS.end();
         return;
     }
 
@@ -776,12 +792,11 @@ static void check_updates() {
     http.end();
 
     if (Update.hasError()) {
-        LittleFS.end();
         // No need to reboot.
         return;
     }
 
-    if (!returned_etag.isEmpty() && !Update.hasError()) {
+    if (!returned_etag.isEmpty()) {
         // We don't appear to be able to open the file as read-write, hence why we close and re-open.
         File file = LittleFS.open("/bin-etag", "w");
         size_t written = file.write((uint8_t *)returned_etag.c_str(), returned_etag.length());

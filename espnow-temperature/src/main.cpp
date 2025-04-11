@@ -10,6 +10,8 @@
 #include <esp_now.h>
 #include <WiFi.h>
 #include <esp_wifi.h> // only for esp_wifi_set_channel()
+#include <Update.h>
+#include <HTTPClient.h>
 #else
 #include <ESP8266WiFi.h>
 #include <espnow.h>
@@ -37,9 +39,9 @@ uint8_t receiver_macs[][6] = {
       //{0x78, 0x42, 0x1c, 0x6a, 0x2d, 0x14},       // WiFi MAC on ESP32 Ethernet (w headers)
       //{0x30, 0xc9, 0x22, 0xef, 0x42, 0xc4},       // WiFi MAC on ESP32 Ethernet (directly soldered).
       //{0x84, 0xfc, 0xe6, 0x78, 0x23, 0xec},       // seeed esp32-s3 number 2
-        {0x7D, 0xDF, 0xA1, 0x86, 0x00, 0xf8},       // Multicast
-        {0xFF, 0xDF, 0xA1, 0x00, 0x00, 0xf8},       // Multicast
-        {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF},
+//        {0x7D, 0xDF, 0xA1, 0x86, 0x00, 0xf8},       // Multicast
+        {0xFF, 0xFF, 0xFF, 0x00, 0x00, 0xf8},       // Multicast
+//        {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF},
 };
 //uint8_t receiver_mac[6] = {0x34, 0x94, 0x54, 0x24, 0x95, 0xc8};     // esp32-receiver
 //uint8_t receiver_mac[6] = {0x30, 0x30, 0xf9, 0x18, 0x14, 0xf8};     // seeed esp32-s3 number 1
@@ -47,6 +49,11 @@ uint8_t receiver_macs[][6] = {
 //uint8_t receiver_mac[6] = {0xdc, 0xa6, 0x32, 0xcc, 0xa6, 0x4d};     // pi wlan0
 //uint8_t receiver_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 #define NUM_RECEIVERS (sizeof(receiver_macs)/6)
+
+#ifdef ESP32
+static esp_now_peer_info_t peerInfo[NUM_RECEIVERS];
+#endif
+
 
 typedef struct {
     uint32_t sequence;
@@ -60,6 +67,10 @@ typedef struct {
 
 static const int SUCCESS_SLEEP_SECONDS = 2 * 60;
 static const int FAIL_SLEEP_SECONDS = 1 * 60;
+
+#ifdef ESP32
+RTC_DATA_ATTR
+#endif
 static payload_t payload;
 
 static int receives_outstanding;
@@ -68,9 +79,7 @@ static int successful_sends;
 
 static void send_message(bool data_unavailable, float humidity, float temperature);
 
-#ifdef ESP32
-static esp_now_peer_info_t peerInfo;
-#endif
+static void set_wifi_channel(uint channel);
 
 void check_updates() {
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -169,7 +178,7 @@ void check_updates() {
     size_t written = Update.writeStream(http.getStream());
     Serial.printf("Written %d, expect remaining to be zero: %d\n", written, Update.remaining());
     Update.end();
-    Serial.printf("Update status = %s\n", Update.getErrorString().c_str());
+    Serial.printf("Update status = %d\n", Update.getError());
 
     http.end();
     WiFi.disconnect();
@@ -183,7 +192,7 @@ void check_updates() {
     if (!returned_etag.isEmpty() && !Update.hasError()) {
         // We don't appear to be able to open the file as read-write, hence why we close and re-open.
         File file = LittleFS.open("/bin-etag", "w");
-        size_t written = file.write(returned_etag.c_str(), returned_etag.length());
+        size_t written = file.write((uint8_t *)returned_etag.c_str(), returned_etag.length());
         Serial.printf("Saved etag. written=%d out of %d for %s\n", written,returned_etag.length(), returned_etag.c_str());
         file.close();
     }
@@ -240,7 +249,9 @@ void OnDataSent(uint8_t *mac_addr, uint8_t status) {
     payload.last_send_time_millis = millis() - payload.time_millis;
     payload.sequence++;
 
+#ifdef ESP8266
     ESP.rtcUserMemoryWrite(RTC_MEMORY_ADDR, (uint32_t *)&payload, sizeof(payload_t));
+#endif
 
     uint64_t sleep_time_secs;
     if (successful_sends) {
@@ -255,10 +266,17 @@ void OnDataSent(uint8_t *mac_addr, uint8_t status) {
     Serial.print(" millis. Sleeping ");
     Serial.print(sleep_time_secs); Serial.println(" secs");
     Serial.flush();
+#ifdef LED_BUILTIN
     digitalWrite(LED_BUILTIN, LOW);
+#endif
 
+#ifdef ESP32
+    esp_sleep_enable_timer_wakeup(sleep_time_secs * 1000L * 1000L);
+    esp_deep_sleep_start();
+#else
     // Instant does not wait for WiFi chip to idle.
     ESP.deepSleepInstant(sleep_time_secs * 1000000L);
+#endif
 }
 
 void setup() {
@@ -268,16 +286,33 @@ void setup() {
     //  read DHT takes about 10ms.
     //  send/ack espnow takes a couple of ms (or up to about 15ms if there is no receiver to ack).
 
+#ifdef LED_BUILTIN
     pinMode(LED_BUILTIN, OUTPUT);
     digitalWrite(LED_BUILTIN, HIGH);
+#endif
 
     Serial.begin(115200);
     Serial.println();
-    Serial.print("Reset reason: ");
-    Serial.println(ESP.getResetInfoPtr()->reason == REASON_DEEP_SLEEP_AWAKE);
 
-    if (ESP.getResetInfoPtr()->reason == REASON_DEEP_SLEEP_AWAKE) {
+#ifdef ESP8266
+    uint32 reset_reason = ESP.getResetInfoPtr()->reason;
+    bool deep_sleep_awake = reset_reason = REASON_DEEP_SLEEP_AWAKE;
+    uint wakeup_cause = 0;
+#else
+    esp_reset_reason_t reset_reason = esp_reset_reason();
+    bool deep_sleep_awake = reset_reason == ESP_RST_DEEPSLEEP;
+    esp_sleep_wakeup_cause_t wakeup_cause = esp_sleep_get_wakeup_cause();
+#endif
+
+    Serial.print("Reset reason: ");
+    Serial.print(reset_reason);
+    Serial.print(", cause: ");
+    Serial.println(wakeup_cause);
+
+    if (deep_sleep_awake) {
+#ifdef ESP8266
         ESP.rtcUserMemoryRead(RTC_MEMORY_ADDR, (uint32_t *)&payload, sizeof(payload_t));
+#endif
     } else {
         memset(&payload, 0, sizeof(payload_t));
     }
@@ -285,7 +320,7 @@ void setup() {
     if (payload.restarts_before_update_required <= 0) {
         check_updates();
         WiFi.disconnect();
-        wifi_set_channel(WIFI_CHANNEL);
+        set_wifi_channel(WIFI_CHANNEL);
         payload.restarts_before_update_required = 16;
     } else {
         payload.restarts_before_update_required--;
@@ -296,11 +331,7 @@ void setup() {
     // Set device as a Wi-Fi Station
     WiFi.mode(WIFI_STA);
 
-#ifdef ESP32
-    esp_wifi_set_channel(WIFI_CHANNEL ,WIFI_SECOND_CHAN_NONE);
-#else
-    wifi_set_channel(WIFI_CHANNEL);
-#endif
+    set_wifi_channel(WIFI_CHANNEL);
 
     // Init ESP-NOW
     if (esp_now_init() != ESP_OK) {
@@ -332,7 +363,7 @@ void setup() {
 
     // On first power on the DHT might not be ready.
     // NB - this only applies to power-on; it should be OK after deep sleep.
-    for (int i = 0; i < (ESP.getResetInfoPtr()->reason == REASON_DEEP_SLEEP_AWAKE ? 2 : 10); i++) {
+    for (int i = 0; i < (deep_sleep_awake ? 2 : 10); i++) {
         h = dht.readHumidity(true);
         t = dht.readTemperature();
 
@@ -356,6 +387,15 @@ void setup() {
     send_message(true, 0, 0);
 }
 
+static void set_wifi_channel(uint channel) {
+#ifdef ESP32
+    esp_wifi_set_channel(channel ,WIFI_SECOND_CHAN_NONE);
+#else
+    wifi_set_channel(channel);
+#endif
+
+}
+
 void loop() {
     // Waiting for esp_now_send to be acked.
     delay(1000);
@@ -368,11 +408,11 @@ static void send_message(bool data_unavailable, float humidity, float temperatur
     if (data_unavailable) {
         snprintf(buff, sizeof buff,
                  "{ "
-                 "\"seq\": %d, "
-                 "\"upd_grace\": %d, "
+                 "\"seq\": %lu, "
+                 "\"upd_grace\": %ld, "
                  "\"run\": %lu, "
-                 "\"success\": %d, "
-                 "\"fail\": %d"
+                 "\"success\": %lu, "
+                 "\"fail\": %lu"
                  "}",
                  payload.sequence,
                  payload.restarts_before_update_required,
@@ -382,11 +422,11 @@ static void send_message(bool data_unavailable, float humidity, float temperatur
     } else {
         snprintf(buff, sizeof buff,
                  "{ "
-                 "\"seq\": %d, "
-                 "\"upd_grace\": %d, "
+                 "\"seq\": %lu, "
+                 "\"upd_grace\": %ld, "
                  "\"run\": %lu, "
-                 "\"success\": %d, "
-                 "\"fail\": %d, "
+                 "\"success\": %lu, "
+                 "\"fail\": %lu, "
                  "\"t\": %0.1f, "
                  "\"h\": %0.1f"
                  "}",
