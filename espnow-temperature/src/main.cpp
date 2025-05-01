@@ -123,9 +123,9 @@ void check_updates() {
     // TODO - allow us to specify different versions for different instances, based on ChipID.
     char url[128];
 #ifdef ESP8266
-    snprintf(url, sizeof url, "http://192.168.0.2:18080/espnow-temperature/esp8266");
+    snprintf(url, sizeof url, "http://192.168.0.2:18080/%s/esp8266", APP);
 #else
-    snprintf(url, sizeof url, "http://192.168.0.2:18080/espnow-temperature/%s", ESP.getChipModel());
+    snprintf(url, sizeof url, "http://192.168.0.2:18080/%s/%s", APP, ESP.getChipModel());
 #endif
 
     WiFiClient c;
@@ -384,7 +384,6 @@ static void set_wifi_channel(uint channel) {
 #else
     wifi_set_channel(channel);
 #endif
-
 }
 
 void loop() {

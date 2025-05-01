@@ -59,6 +59,8 @@
 
 #define WIFI_WAIT_TIMEOUT_MILLIS 60000
 
+#define MESSAGE_QUEUE_SIZE 5
+
 #define MAC_FORMAT "%02X:%02X:%02X:%02X:%02X:%02X"
 #define MAC_BYTES(MAC) (MAC[0]),(MAC[1]),(MAC[2]),(MAC[3]),(MAC[4]),(MAC[5])
 
@@ -259,7 +261,7 @@ void setup() {
     Serial.begin(115200);
     Serial.println(APP_BANNER);
 
-    q_init(&state.q, sizeof(inbound_t), 3, FIFO, true);
+    q_init(&state.q, sizeof(inbound_t), MESSAGE_QUEUE_SIZE, FIFO, true);
 
     esp_efuse_mac_get_default(chipId);
     snprintf(host, sizeof(host),  HOSTNAME_FORMAT, chipId[4], chipId[5]);
@@ -355,6 +357,7 @@ char *get_info() {
                         "Channel:            %d\r\n"
                         "CPU Freq (Mhz):     %lu\r\n"
                         "Time:               %s\r\n"
+                        "Message Count:      %lu\r\n"
                         "IP:                 %s\r\n",
                         APP_BANNER,
                         ESP.getChipModel(),
@@ -367,6 +370,7 @@ char *get_info() {
                         WIFI_CHANNEL,
                         getCpuFrequencyMhz(),
                         timeClient.getFormattedTime().c_str(),
+                        state.sequence,
                         ethConnected ? ETH.localIP().toString().c_str() : "None"
     );
     return buff;
@@ -806,8 +810,8 @@ static void check_updates() {
         return;
     }
 
-    size_t written = Update.writeStream(http.getStream());
-    Serial.printf("Written %d, expect remaining to be zero: %d\n", written, Update.remaining());
+    size_t updatedSize = Update.writeStream(http.getStream());
+    Serial.printf("Written %d, expect remaining to be zero: %d\n", updatedSize, Update.remaining());
     Update.end();
     Serial.printf("Update %s: status = %d\n", Update.hasError() ? "FAILED": "OK", Update.getError());
 
